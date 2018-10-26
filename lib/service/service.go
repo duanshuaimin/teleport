@@ -133,6 +133,25 @@ const (
 	// ServiceExitedWithErrorEvent is emitted whenever a service
 	// has exited with an error, the payload includes the error
 	ServiceExitedWithErrorEvent = "ServiceExitedWithError"
+
+	// TeleportDegradedEvent is emitted whenever a service is operating in a
+	// degraded manner.
+	TeleportDegradedEvent = "TeleportDegraded"
+
+	// TeleportOKEvent is emitted whenever a service is operating normally.
+	TeleportOKEvent = "TeleportOKEvent"
+)
+
+const (
+	// stateOK means Teleport is operating normally.
+	stateOK = 0
+
+	// stateRecovering means Teleport has begun recovering from a degraded state.
+	stateRecovering = 1
+
+	// stateDegraded means some kind of connection error has occured to put
+	// Teleport into a degraded state.
+	stateDegraded = 2
 )
 
 // RoleConfig is a configuration for a server role (either proxy or node)
@@ -528,9 +547,13 @@ func NewTeleport(cfg *Config) (*TeleportProcess, error) {
 		return nil, trace.Wrap(err)
 	}
 
+	if cfg.Clock == nil {
+		cfg.Clock = clockwork.NewRealClock()
+	}
+
 	processID := fmt.Sprintf("%v", nextProcessID())
 	process := &TeleportProcess{
-		Clock:               clockwork.NewRealClock(),
+		Clock:               cfg.Clock,
 		Supervisor:          NewSupervisor(processID),
 		Config:              cfg,
 		Identities:          make(map[teleport.Role]*auth.Identity),
@@ -1405,27 +1428,17 @@ func (process *TeleportProcess) initDiagnosticService() error {
 	log := logrus.WithFields(logrus.Fields{
 		trace.Component: teleport.Component(teleport.ComponentDiagnostic, process.id),
 	})
-	var ready int64
-	process.RegisterFunc("diagnostic.readyz", func() error {
-		eventC := make(chan Event, 1)
-		process.WaitForEvent(process.ExitContext(), TeleportReadyEvent, eventC)
-		select {
-		case <-eventC:
-			atomic.StoreInt64(&ready, 1)
-			log.Infof("Detected that service started and joined the cluster successfully.")
-		case <-process.ExitContext().Done():
-			log.Debugf("Teleport is exiting, returning.")
-		}
+
+	// Monitor the internal state of Teleport and serve the /readyz endpoint
+	// from which the state can be fetched.
+	var state int64
+	process.RegisterFunc("readyz.handler", func() error {
+		mux.HandleFunc("/readyz", process.readyzHandler(&state))
 		return nil
 	})
-
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		isReady := atomic.LoadInt64(&ready)
-		if isReady == 1 {
-			roundtrip.ReplyJSON(w, http.StatusOK, map[string]interface{}{"status": "ok"})
-		} else {
-			roundtrip.ReplyJSON(w, http.StatusServiceUnavailable, map[string]interface{}{"status": "teleport is is not ready, check logs for details"})
-		}
+	process.RegisterFunc("readyz.monitor", func() error {
+		process.readyzMonitor(&state)
+		return nil
 	})
 
 	listener, err := process.importOrCreateListener(teleport.ComponentDiagnostic, process.Config.DiagnosticAddr.Addr)
@@ -1460,6 +1473,77 @@ func (process *TeleportProcess) initDiagnosticService() error {
 		log.Infof("Exited.")
 	})
 	return nil
+}
+
+// readyzHandler serves the /readyz endpoint which can be used to fetch the
+// state of Teleport.
+func (process *TeleportProcess) readyzHandler(state *int64) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch atomic.LoadInt64(state) {
+		// 503
+		case stateDegraded:
+			roundtrip.ReplyJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+				"status": "teleport is in a degraded state, check logs for details",
+			})
+		// 400
+		case stateRecovering:
+			roundtrip.ReplyJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"status": "teleport is recovering from a degraded state, check logs for details",
+			})
+		// 200
+		case stateOK:
+			roundtrip.ReplyJSON(w, http.StatusOK, map[string]interface{}{
+				"status": "ok",
+			})
+		}
+	}
+}
+
+// readyzMonitor monitors for events occuring within Teleport and updates
+// its internal state.
+func (process *TeleportProcess) readyzMonitor(state *int64) {
+	var recoveryTime time.Time
+
+	// Start loop to monitor for events that are used to update Teleport state.
+	eventCh := make(chan Event, 1024)
+	process.WaitForEvent(process.ExitContext(), TeleportReadyEvent, eventCh)
+	process.WaitForEvent(process.ExitContext(), TeleportDegradedEvent, eventCh)
+	process.WaitForEvent(process.ExitContext(), TeleportOKEvent, eventCh)
+
+	for {
+		select {
+		case e := <-eventCh:
+			switch e.Name {
+			// Ready event means Teleport has started successfully.
+			case TeleportReadyEvent:
+				atomic.StoreInt64(state, stateOK)
+				log.Infof("Detected that service started and joined the cluster successfully.")
+			// If a degraded event was received, always change the state to degraded.
+			case TeleportDegradedEvent:
+				atomic.StoreInt64(state, stateDegraded)
+				log.Infof("Detected Teleport is running in a degraded state.")
+			// If the current state is degraded, and a OK event has been
+			// received, change the state to recovering. If the current state is
+			// recovering and a OK events is received, if it's been longer
+			// than the recovery time (2 time the server heartbeat ttl), change
+			// state to OK.
+			case TeleportOKEvent:
+				switch atomic.LoadInt64(state) {
+				case stateDegraded:
+					atomic.StoreInt64(state, stateRecovering)
+					recoveryTime = process.Clock.Now()
+					log.Infof("Teleport is recovering from a degraded state.")
+				case stateRecovering:
+					if process.Clock.Now().Sub(recoveryTime) > defaults.ServerHeartbeatTTL*2 {
+						atomic.StoreInt64(state, stateOK)
+						log.Infof("Teleport has recovered from a degraded state.")
+					}
+				}
+			}
+		case <-process.ExitContext().Done():
+			log.Debugf("Teleport is exiting, returning.")
+		}
+	}
 }
 
 // getAdditionalPrincipals returns a list of additional principals to add
